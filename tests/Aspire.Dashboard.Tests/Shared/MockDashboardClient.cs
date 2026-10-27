@@ -1,7 +1,9 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
+using System.Threading.Channels;
 using Aspire.Dashboard.Model;
 using Aspire.Dashboard.Otlp.Storage;
 using Aspire.DashboardService.Proto.V1;
@@ -34,6 +36,9 @@ public sealed class MockDashboardClient : IDashboardClient, IResourceRepositoryW
         state: KnownResourceState.Running);
 
     private readonly IReadOnlyList<ResourceViewModel>? _resources;
+    private readonly object _interactionsLock = new();
+    private readonly List<WatchInteractionsResponseUpdate> _pendingInteractions = [];
+    private readonly List<Channel<WatchInteractionsResponseUpdate>> _interactionSubscribers = [];
 
     public MockDashboardClient(IReadOnlyList<ResourceViewModel>? resources = null)
     {
@@ -89,14 +94,67 @@ public sealed class MockDashboardClient : IDashboardClient, IResourceRepositoryW
         yield return [];
     }
 
-    public IAsyncEnumerable<WatchInteractionsResponseUpdate> SubscribeInteractionsAsync(CancellationToken cancellationToken)
+    public ConcurrentQueue<WatchInteractionsRequestUpdate> InteractionRequests { get; } = new();
+
+    // Pending interactions are replayed to new subscribers so a test can add one before or after the circuit connects.
+    public void AddInteraction(WatchInteractionsResponseUpdate interaction)
     {
-        throw new NotImplementedException();
+        lock (_interactionsLock)
+        {
+            if (interaction.KindCase == WatchInteractionsResponseUpdate.KindOneofCase.Complete)
+            {
+                _pendingInteractions.RemoveAll(i => i.InteractionId == interaction.InteractionId);
+            }
+            else
+            {
+                _pendingInteractions.Add(interaction);
+            }
+
+            foreach (var subscriber in _interactionSubscribers)
+            {
+                subscriber.Writer.TryWrite(interaction);
+            }
+        }
     }
 
+    public async IAsyncEnumerable<WatchInteractionsResponseUpdate> SubscribeInteractionsAsync([EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var channel = Channel.CreateUnbounded<WatchInteractionsResponseUpdate>();
+        lock (_interactionsLock)
+        {
+            foreach (var interaction in _pendingInteractions)
+            {
+                channel.Writer.TryWrite(interaction);
+            }
+            _interactionSubscribers.Add(channel);
+        }
+
+        try
+        {
+            await foreach (var interaction in channel.Reader.ReadAllAsync(cancellationToken))
+            {
+                yield return interaction;
+            }
+        }
+        finally
+        {
+            lock (_interactionsLock)
+            {
+                _interactionSubscribers.Remove(channel);
+            }
+        }
+    }
+
+    // Mirrors the server completing the interaction once a submitted request is accepted.
     public Task SendInteractionRequestAsync(WatchInteractionsRequestUpdate request, CancellationToken cancellationToken)
     {
-        throw new NotImplementedException();
+        InteractionRequests.Enqueue(request);
+        AddInteraction(new WatchInteractionsResponseUpdate
+        {
+            InteractionId = request.InteractionId,
+            Complete = new InteractionComplete()
+        });
+        return Task.CompletedTask;
     }
 
     public ResourceViewModel? GetResource(string resourceName) =>
